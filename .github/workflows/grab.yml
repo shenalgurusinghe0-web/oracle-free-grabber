@@ -1,0 +1,50 @@
+name: Grab free Oracle server
+# Asks Oracle for an ALWAYS FREE server every ~10 min until it gets one, then turns itself off.
+# Only Always Free shapes: VM.Standard.A1.Flex (1 OCPU / 6 GB) or VM.Standard.E2.1.Micro.
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+permissions:
+  actions: write
+  issues: write
+concurrency: grab
+jobs:
+  grab:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Install Oracle CLI
+        run: pip install -q oci-cli
+      - name: Try to grab a free server
+        env:
+          OCI_BUNDLE: ${{ secrets.OCI_BUNDLE }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -u
+          [ -n "$OCI_BUNDLE" ] || { echo "Secret OCI_BUNDLE missing"; exit 0; }
+          mkdir -p ~/.oci && cd ~/.oci
+          echo "$OCI_BUNDLE" | base64 -d | tar xz
+          sed -i "s|KEYFILE|$HOME/.oci/key.pem|" config && chmod 600 key.pem config
+          export OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING=True
+          TEN=$(awk -F= '/^tenancy/{print $2}' config)
+          EXIST=$(oci compute instance list -c "$TEN" --display-name shenal-wa --query "data[?\"lifecycle-state\"!='TERMINATED'] | [0].id" --raw-output 2>/dev/null)
+          if [ -n "$EXIST" ] && [ "$EXIST" != "null" ]; then echo "Server already exists, switching off."; gh workflow disable grab.yml || true; exit 0; fi
+          AD=$(oci iam availability-domain list -c "$TEN" --query 'data[0].name' --raw-output)
+          VCN=$(oci network vcn list -c "$TEN" --display-name shenal-wa-vcn --query 'data[0].id' --raw-output)
+          SUB=$(oci network subnet list -c "$TEN" --vcn-id "$VCN" --query 'data[0].id' --raw-output)
+          try(){ local SHAPE=$1; shift
+            IMG=$(oci compute image list -c "$TEN" --operating-system "Canonical Ubuntu" --operating-system-version "24.04" --shape "$SHAPE" --sort-by TIMECREATED --query 'data[0].id' --raw-output)
+            echo "Trying $SHAPE (Always Free)"
+            oci compute instance launch -c "$TEN" --availability-domain "$AD" --shape "$SHAPE" "$@" --image-id "$IMG" --subnet-id "$SUB" \
+              --assign-public-ip true --display-name shenal-wa --ssh-authorized-keys-file ~/.oci/ssh.pub --query data.id --raw-output 2>err.txt
+            local rc=$?; grep -o '"message": "[^"]*"' err.txt | head -1; return $rc; }
+          if try VM.Standard.A1.Flex --shape-config '{"ocpus":1,"memoryInGBs":6}' || { sleep 75; try VM.Standard.E2.1.Micro; }; then
+            echo "GOT A FREE SERVER"
+            gh issue create --title "Free Oracle server grabbed!" --body "The free server 'shenal-wa' is being created in Singapore. Tell Claude: server is ready." || true
+            gh workflow disable grab.yml || true
+          else
+            echo "No free capacity this time. Will try again in ~10 min."
+          fi
+          exit 0
