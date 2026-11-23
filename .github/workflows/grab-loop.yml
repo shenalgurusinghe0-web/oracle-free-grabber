@@ -1,0 +1,57 @@
+name: Grab free Oracle server (loop)
+# Each run keeps trying for ~5.5 hours (A1 every 3 min, Micro every 15 min), so it works
+# even when GitHub only starts scheduled runs a few times a day. ALWAYS FREE shapes only.
+on:
+  schedule:
+    - cron: "17 */2 * * *"
+  workflow_dispatch:
+permissions:
+  actions: write
+  issues: write
+concurrency: grab
+jobs:
+  grab:
+    runs-on: ubuntu-latest
+    timeout-minutes: 345
+    steps:
+      - name: Install Oracle CLI
+        run: pip install -q oci-cli
+      - name: Keep trying to grab a free server
+        env:
+          OCI_BUNDLE: ${{ secrets.OCI_BUNDLE }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          SUPPRESS_LABEL_WARNING: "True"
+          OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING: "True"
+        run: |
+          set -u
+          [ -n "$OCI_BUNDLE" ] || { echo "Secret OCI_BUNDLE missing"; exit 0; }
+          mkdir -p ~/.oci && cd ~/.oci
+          echo "$OCI_BUNDLE" | base64 -d | tar xz
+          sed -i "s|KEYFILE|$HOME/.oci/key.pem|" config && chmod 600 key.pem config
+          TEN=$(awk -F= '/^tenancy/{print $2}' config)
+          done_off(){ gh workflow disable grab.yml || true; gh workflow disable grab-loop.yml || true; }
+          exists(){ E=$(oci compute instance list -c "$TEN" --display-name shenal-wa --query "data[?\"lifecycle-state\"!='TERMINATED'] | [0].id" --raw-output 2>/dev/null); [ -n "$E" ] && [ "$E" != "null" ]; }
+          if exists; then echo "Server already exists, switching off."; done_off; exit 0; fi
+          AD=$(oci iam availability-domain list -c "$TEN" --query 'data[0].name' --raw-output)
+          VCN=$(oci network vcn list -c "$TEN" --display-name shenal-wa-vcn --query 'data[0].id' --raw-output)
+          SUB=$(oci network subnet list -c "$TEN" --vcn-id "$VCN" --query 'data[0].id' --raw-output)
+          IMG_A1=$(oci compute image list -c "$TEN" --operating-system "Canonical Ubuntu" --operating-system-version "24.04" --shape VM.Standard.A1.Flex --sort-by TIMECREATED --query 'data[0].id' --raw-output)
+          IMG_MI=$(oci compute image list -c "$TEN" --operating-system "Canonical Ubuntu" --operating-system-version "24.04" --shape VM.Standard.E2.1.Micro --sort-by TIMECREATED --query 'data[0].id' --raw-output)
+          launch(){ local SHAPE=$1 IMG=$2; shift 2
+            oci compute instance launch -c "$TEN" --availability-domain "$AD" --shape "$SHAPE" "$@" --image-id "$IMG" --subnet-id "$SUB" \
+              --assign-public-ip true --display-name shenal-wa --ssh-authorized-keys-file ~/.oci/ssh.pub --query data.id --raw-output 2>err.txt
+            local rc=$?; echo "$(date -u +%H:%M) $SHAPE: $(grep -o '"message": "[^"]*"' err.txt | head -1)"; return $rc; }
+          END=$(( $(date +%s) + 330*60 )); i=0
+          while [ "$(date +%s)" -lt "$END" ]; do
+            i=$((i+1))
+            if launch VM.Standard.A1.Flex "$IMG_A1" --shape-config '{"ocpus":1,"memoryInGBs":6}' \
+               || { [ $((i % 5)) -eq 0 ] && sleep 60 && launch VM.Standard.E2.1.Micro "$IMG_MI"; }; then
+              echo "GOT A FREE SERVER"
+              gh issue create --title "Free Oracle server grabbed!" --body "The free server 'shenal-wa' is being created in Singapore. Tell Claude: server ready." || true
+              done_off; exit 0
+            fi
+            sleep 180
+          done
+          echo "No free slot this round ($i tries). Next round starts on schedule."
+          exit 0
